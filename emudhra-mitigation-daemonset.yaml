@@ -4,136 +4,254 @@ metadata:
   name: emudhra-ca-mitigation
   namespace: kube-system
 data:
-  mitigate.py: |
-    #!/usr/bin/env python3
-    """Run in the worker node's mount/PID/network namespaces, as root."""
-    import argparse
-    import fcntl
-    import hashlib
-    import os
-    from pathlib import Path
-    import re
-    import ssl
-    import subprocess
-    import tempfile
-    
-    BLOCKED = {
-        "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b": "emSign ECC Root CA - G3",
-        "d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4": "AAA Certificate Services",
+  mitigate.sh: |
+    #!/bin/bash
+    set -Eeuo pipefail
+    export LC_ALL=C
+    umask 077
+    CERT_DIR=/etc/ssl/certs
+    STATE=/var/lib/yc-emudhra-mitigation
+    MARKER=$STATE/restart-state-v3
+    REQUIRED=$STATE/restart-required-v3
+    WORK=$(mktemp -d /tmp/emudhra.XXXXXXXX)
+    trap 'rm -rf -- "$WORK"' EXIT
+    trap 'echo "FAIL: mitigation failed at line $LINENO" >&2' ERR
+    BLOCKED='86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'
+    declare -A fingerprints=()
+
+    fail() { echo "FAIL: $*" >&2; exit 1; }
+    file_hash() { sha256sum -- "$1" | cut -d ' ' -f 1; }
+
+    # Temp file and destination share a filesystem. Replace symlinks, not targets.
+    atomic_copy() {
+        local source=$1 dest=$2 mode=${3:-600} tmp
+        tmp=$(mktemp "${dest%/*}/.emudhra.XXXXXXXX")
+        cp -- "$source" "$tmp"
+        chmod "$mode" "$tmp"
+        sync "$tmp"
+        mv -fT -- "$tmp" "$dest"
+        sync -f "${dest%/*}"
     }
-    ENTRIES = {"mozilla/emSign_ECC_Root_CA_-_G3.crt", "mozilla/Comodo_AAA_Services_root.crt"}
-    CONFIG = Path("/etc/ca-certificates.conf")
-    BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
-    CERT_DIR = Path("/etc/ssl/certs")
-    STATE = Path("/var/lib/yc-emudhra-mitigation")
-    DEBIAN_VERSION = Path("/etc/debian_version")
-    PEM = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
-    
-    
-    def log(message):
-        print(message, flush=True)
-    
-    
-    def atomic_write(path, data, mode=0o644):
-        fd, name = tempfile.mkstemp(prefix=".emudhra-", dir=str(path.parent))
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-                os.fchmod(stream.fileno(), mode)
-            os.replace(name, path)
-        finally:
-            if os.path.exists(name):
-                os.unlink(name)
-    
-    
-    def disabled_config(text):
-        lines = text.splitlines(keepends=True)
-        return "".join("!" + line if line.strip() in ENTRIES else line for line in lines)
-    
-    
-    def fingerprints(data):
-        return [hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
-                for pem in PEM.findall(data)]
-    
-    
-    def verify():
-        if not BUNDLE.is_file() or not CERT_DIR.is_dir():
-            raise RuntimeError("System CA store missing")
-        # Parsing the bundle independently also rejects an empty/unusable store.
-        ssl.create_default_context(cafile=str(BUNDLE))
-        if not fingerprints(BUNDLE.read_text()):
-            raise RuntimeError("Empty CA bundle")
-        affected = []
-        for path in sorted(CERT_DIR.iterdir()):
-            if path.is_file():
-                for digest in fingerprints(path.read_text(errors="replace")):
-                    if digest in BLOCKED:
-                        affected.append("{}: {}".format(path, BLOCKED[digest]))
-        if affected:
-            raise RuntimeError("Distrusted roots remain (including possible custom copies): " + "; ".join(affected))
-        if disabled_config(CONFIG.read_text()) != CONFIG.read_text():
-            raise RuntimeError("Distrusted roots are still enabled in ca-certificates.conf")
-    
-    
-    def run(*args):
-        subprocess.run(args, check=True, timeout=180)
-    
-    
-    def reconcile():
-        if not DEBIAN_VERSION.exists():
-            raise RuntimeError("Only Debian/Ubuntu update-ca-certificates stores are supported")
-        original = CONFIG.read_bytes()
-        updated = disabled_config(original.decode()).encode()
-        backup = STATE / "ca-certificates.conf.before"
-        if not backup.exists():
-            atomic_write(backup, original, 0o600)
-        if updated != original:
-            atomic_write(CONFIG, updated, CONFIG.stat().st_mode & 0o777)
-            log("Disabled the two affected Mozilla CA entries")
-        try:
-            verify()
-        except (RuntimeError, ssl.SSLError):
-            # Also repairs interruption after writing the configuration but before
-            # regenerating the bundle. Never uses apt or changes unrelated packages.
-            run("update-ca-certificates", "--fresh")
-            verify()
-        digest = hashlib.sha256(BUNDLE.read_bytes()).hexdigest()
-        marker = STATE / "restarted-bundle.sha256"
-        if not marker.exists() or marker.read_text().strip() != digest:
-            # Go clients may cache system roots for their entire process lifetime.
-            # Write the marker only after containerd has restarted successfully.
-            run("systemctl", "restart", "containerd")
-            run("systemctl", "is-active", "--quiet", "containerd")
-            atomic_write(marker, (digest + "\n").encode(), 0o600)
-            log("Restarted containerd to reload the CA store")
-        verify()
-        log("PASS: affected roots absent from system bundle and certificate directory")
-    
-    
-    def main():
-        parser = argparse.ArgumentParser()
-        parser.add_argument("mode", choices=("apply", "check"))
-        args = parser.parse_args()
-        if args.mode == "check":
-            verify()
-            digest = hashlib.sha256(BUNDLE.read_bytes()).hexdigest()
-            if (STATE / "restarted-bundle.sha256").read_text().strip() != digest:
-                raise RuntimeError("Containerd has not yet reloaded this CA bundle")
-            return
-        STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with (STATE / "lock").open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            reconcile()
-    
-    
-    if __name__ == "__main__":
-        try:
-            main()
-        except Exception as error:
-            log("FAIL: {}".format(error))
-            raise SystemExit(1)
+
+    # Output line ranges of distrusted PEM blocks; collect all retained fingerprints.
+    # Parse each certificate with OpenSSL. Cache identical blocks within this run.
+    scan_file() {
+        local file=$1 cert hash fingerprint first last
+        rm -rf -- "$WORK/parts"
+        mkdir "$WORK/parts"
+        awk -v dir="$WORK/parts" '
+          /^-----BEGIN CERTIFICATE-----\r?$/ {
+            if (inside) exit 2
+            inside=1; first=NR; count++; out=dir "/" count ".pem"
+          }
+          inside { print $0 > out }
+          /^-----END CERTIFICATE-----\r?$/ {
+            if (!inside) exit 2
+            close(out); print first, NR, out; inside=0
+          }
+          END { if (inside) exit 2 }
+        ' "$file" > "$WORK/parts/index"
+        : > "$WORK/ranges"
+        while read -r first last cert; do
+            hash=$(file_hash "$cert")
+            fingerprint=${fingerprints[$hash]:-}
+            if [[ -z $fingerprint ]]; then
+                fingerprint=$(openssl x509 -in "$cert" -outform DER | sha256sum | cut -d ' ' -f 1)
+                fingerprints[$hash]=$fingerprint
+            fi
+            if [[ " $BLOCKED " == *" $fingerprint "* ]]; then
+                printf '%s %s\n' "$first" "$last" >> "$WORK/ranges"
+            else
+                printf '%s\n' "$fingerprint" >> "$WORK/hashes"
+            fi
+        done < "$WORK/parts/index"
+    }
+
+    verify_store() {
+        local file
+        : > "$WORK/hashes"
+        [[ -s $CERT_DIR/ca-certificates.crt ]] || fail 'Missing or empty CA bundle'
+        openssl crl2pkcs7 -nocrl -certfile "$CERT_DIR/ca-certificates.crt" -out "$WORK/bundle.p7b"
+        grep -q '^-----BEGIN CERTIFICATE-----' "$CERT_DIR/ca-certificates.crt" || fail 'No CA in bundle'
+        for file in "$CERT_DIR"/*; do
+            [[ -f $file ]] || continue
+            scan_file "$file"
+            [[ ! -s $WORK/ranges ]] || fail "Distrusted CA remains in $file"
+        done
+        STORE_DIGEST=$(sort -u "$WORK/hashes" | sha256sum | cut -d ' ' -f 1)
+    }
+
+    clean_store() {
+        local file n=0 i old mode name
+        local -a paths=() hashes=() modes=()
+        : > "$WORK/hashes"
+        # Prepare the entire plan before touching the host store.
+        for file in "$CERT_DIR"/*; do
+            [[ -f $file ]] || continue
+            old=$(file_hash "$file")
+            scan_file "$file"
+            [[ -s $WORK/ranges ]] || continue
+            paths+=("$file"); hashes+=("$old"); modes+=("$(stat -Lc '%a' "$file")")
+            cp -- "$file" "$WORK/before-$n"
+            awk 'FILENAME==ARGV[1] { for (i=$1;i<=$2;i++) drop[i]=1; next }
+                 !(FNR in drop) { print }' "$WORK/ranges" "$file" > "$WORK/after-$n"
+            if [[ $file == "$CERT_DIR/ca-certificates.crt" ]]; then
+                grep -q '^-----BEGIN CERTIFICATE-----' "$WORK/after-$n" || fail 'Filtering would empty CA bundle'
+                openssl crl2pkcs7 -nocrl -certfile "$WORK/after-$n" -out "$WORK/bundle.p7b"
+            fi
+            n=$((n+1))
+        done
+        (( n > 0 )) || return 0
+        # Even restoring the previous CA digest needs a new runtime restart:
+        # a runtime may have loaded the reintroduced CA in the meantime.
+        printf 'invalid\n' > "$WORK/invalid"
+        atomic_copy "$WORK/invalid" "$MARKER"
+        rm -f -- "$STATE/restart-containerd-v3" "$STATE/restart-dockerd-v3"
+        sync -f "$STATE"
+        for ((i=0;i<n;i++)); do
+            file=${paths[$i]}; name=${file##*/}
+            if [[ ! -e $file && -L $file ]]; then
+                rm -- "$file" # Its distrusted target was removed earlier in this plan.
+                continue
+            fi
+            [[ -f $file && $(file_hash "$file") == "${hashes[$i]}" ]] || fail "CA store changed concurrently: $file"
+            [[ -e $STATE/before-$name ]] || atomic_copy "$WORK/before-$i" "$STATE/before-$name"
+            if grep -q '^-----BEGIN CERTIFICATE-----' "$WORK/after-$i"; then
+                atomic_copy "$WORK/after-$i" "$file" "${modes[$i]}"
+            else
+                rm -- "$file"
+                sync -f "$CERT_DIR"
+            fi
+            echo "Removed distrusted certificate(s) from $file"
+        done
+    }
+
+    # Select only root daemons belonging to the host systemd services.
+    # Docker's private containerd is managed by dockerd, not signalled separately.
+    identity() {
+        local pid=$1 runtime=$2 service=$2 comm stat rest uid
+        [[ $runtime != dockerd ]] || service=docker
+        [[ -r /proc/$pid/comm ]] || return 0
+        read -r comm < "/proc/$pid/comm" || return 0
+        [[ $comm == "$runtime" ]] || return 0
+        grep -q ":/.*system.slice/$service.service$" "/proc/$pid/cgroup" 2>/dev/null || return 0
+        uid=$(awk '/^Uid:/ { print $2 ":" $3 }' "/proc/$pid/status" 2>/dev/null) || return 0
+        [[ $uid == 0:0 ]] || return 0
+        IFS= read -r stat < "/proc/$pid/stat" || return 0
+        rest=${stat##*) }
+        local -a fields
+        read -ra fields <<< "$rest"
+        printf '%s:%s:%s\n' "$(cat /proc/sys/kernel/random/boot_id)" "$pid" "${fields[19]}"
+    }
+
+    find_runtime() {
+        local runtime=$1 proc comm candidate found=''
+        for proc in /proc/[0-9]*; do
+            [[ -r $proc/comm ]] || continue
+            read -r comm < "$proc/comm" 2>/dev/null || continue
+            [[ $comm == "$runtime" ]] || continue
+            candidate=$(identity "${proc##*/}" "$runtime")
+            [[ -n $candidate ]] || continue
+            [[ -z $found ]] || fail "Ambiguous $runtime process in host systemd service"
+            found=$candidate
+        done
+        printf '%s' "$found"
+    }
+
+    restart_runtime() {
+        local runtime=$1 digest=$2 journal=$STATE/restart-$1-v3 current old='' status='' saved='' pid deadline new
+        current=$(find_runtime "$runtime")
+        if [[ -f $journal ]]; then
+            { read -r saved; read -r status; read -r old; } < "$journal"
+        fi
+        if [[ $saved == "$digest" && $status == done && -n $current ]]; then
+            return 0
+        fi
+        if [[ $saved != "$digest" ]]; then
+            [[ -n $current ]] || fail "$runtime missing before restart"
+            old=$current
+            printf '%s\npending\n%s\n' "$digest" "$old" > "$WORK/journal"
+            atomic_copy "$WORK/journal" "$journal"
+        fi
+        if [[ $current == "$old" ]]; then
+            pid=${old#*:}; pid=${pid%%:*}
+            [[ $(identity "$pid" "$runtime") == "$old" ]] || fail "$runtime identity changed before SIGTERM; retry"
+            kill -TERM "$pid"
+            echo "Sent SIGTERM to $runtime PID $pid; waiting for systemd"
+        fi
+        deadline=$((SECONDS+120))
+        while (( SECONDS < deadline )); do
+            new=$(find_runtime "$runtime")
+            if [[ -n $new && $new != "$old" ]]; then
+                sleep 5
+                if [[ $(find_runtime "$runtime") == "$new" ]]; then
+                    printf '%s\ndone\n%s\n' "$digest" "$new" > "$WORK/journal"
+                    atomic_copy "$WORK/journal" "$journal"
+                    echo "$runtime restarted: $new"
+                    return 0
+                fi
+            fi
+            sleep 1
+        done
+        fail "$runtime did not recover; restore the service on the node"
+    }
+
+    check() {
+        local digest runtime count=0
+        verify_store
+        [[ -f $MARKER && ! -e $REQUIRED ]] || fail 'Runtime restart verification incomplete'
+        {
+            read -r digest
+            [[ $digest == "$STORE_DIGEST" ]] || fail 'CA store changed since runtime restart'
+            while read -r runtime; do
+                [[ $runtime == containerd || $runtime == dockerd ]] || fail 'Invalid runtime state'
+                [[ -n $(find_runtime "$runtime") ]] || fail "$runtime is not running"
+                count=$((count+1))
+            done
+        } < "$MARKER"
+        (( count > 0 )) || fail 'No runtime recorded'
+    }
+
+    apply() {
+        local runtime digest old_digest='' current names=''
+        mkdir -p "$STATE"
+        exec 9> "$STATE/lock-v3"
+        flock -n 9 || fail 'Another mitigation is running'
+        clean_store
+        verify_store
+        digest=$STORE_DIGEST
+        [[ ! -f $MARKER ]] || read -r old_digest < "$MARKER"
+        if [[ $old_digest != "$digest" || -e $REQUIRED ]]; then
+            if [[ -e $REQUIRED ]]; then
+                names=$(tail -n +2 "$REQUIRED")
+            fi
+            for runtime in containerd dockerd; do
+                current=$(find_runtime "$runtime")
+                [[ -z $current ]] || names+=$'\n'"$runtime"
+            done
+            names=$(printf '%s\n' "$names" | sed '/^$/d' | sort -u)
+            [[ -n $names ]] || fail 'No host containerd or dockerd service found'
+            printf '%s\n%s\n' "$digest" "$names" > "$WORK/required"
+            atomic_copy "$WORK/required" "$REQUIRED"
+            while read -r runtime; do
+                [[ $runtime == containerd || $runtime == dockerd ]] || fail 'Invalid runtime journal'
+                restart_runtime "$runtime" "$digest"
+            done <<< "$names"
+            verify_store
+            [[ $STORE_DIGEST == "$digest" ]] || fail 'CA store changed during runtime restart'
+            atomic_copy "$WORK/required" "$MARKER"
+            rm -- "$REQUIRED"
+            sync -f "$STATE"
+        fi
+        check
+        echo 'PASS: affected roots absent; runtimes running with verified CA store'
+    }
+
+    case ${1:-} in
+        apply) apply ;;
+        check) check ;;
+        *) fail 'Usage: mitigate.sh apply|check' ;;
+    esac
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -153,6 +271,8 @@ spec:
       maxUnavailable: 1
   template:
     metadata:
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/mitigate: unconfined
       labels:
         app: emudhra-ca-mitigation
     spec:
@@ -161,51 +281,124 @@ spec:
       nodeSelector:
         kubernetes.io/os: linux
       tolerations:
-        - operator: Exists
-      terminationGracePeriodSeconds: 210
+      - operator: Exists
+      terminationGracePeriodSeconds: 150
       containers:
-        - name: mitigate
-          image: cr.yandex/mirror/ubuntu:22.04
-          imagePullPolicy: IfNotPresent
-          securityContext:
-            privileged: true
-            runAsUser: 0
-            readOnlyRootFilesystem: true
-          command:
-            - /bin/bash
-            - -ec
+      - name: mitigate
+        image: cr.yandex/yc/mk8s-openssl:stable
+        imagePullPolicy: Never
+        securityContext:
+          privileged: false
+          runAsUser: 0
+          runAsGroup: 0
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        env:
+        - name: SCRIPT_SHA256
+          value: cf9747e723125372dfde971896fef047825afd9b0e5a36736012b7aabd857f1e
+        command:
+        - bash
+        - -c
+        - |
+          set -Eeuo pipefail
+          mode=$1
+          while true; do
+              # The sentinel preserves trailing newlines in the in-memory snapshot.
+              source=$(cat /opt/mitigation/mitigate.sh; printf '.')
+              source=${source%.}
+              actual=$(printf '%s' "$source" | sha256sum | cut -d ' ' -f 1)
+              if [[ $actual != "$SCRIPT_SHA256" ]]; then
+                  echo 'FAIL: mitigation script SHA-256 mismatch; refusing execution' >&2
+                  exit 1
+              fi
+              run_mode=$mode
+              [[ $mode != loop ]] || run_mode=apply
+              bash -c "$source" mitigation "$run_mode"
+              [[ $mode == loop ]] || break
+              sleep 3600
+          done
+        - launcher
+        - loop
+        readinessProbe:
+          exec:
+            command:
+            - bash
+            - -c
             - |
-              trap 'exit 0' TERM INT
+              set -Eeuo pipefail
+              mode=$1
               while true; do
-                nsenter --target 1 --mount --uts --ipc --net --pid --root --wd -- \
-                  python3 - apply < /opt/mitigation/mitigate.py
-                sleep 300 &
-                wait $!
+                  # The sentinel preserves trailing newlines in the in-memory snapshot.
+                  source=$(cat /opt/mitigation/mitigate.sh; printf '.')
+                  source=${source%.}
+                  actual=$(printf '%s' "$source" | sha256sum | cut -d ' ' -f 1)
+                  if [[ $actual != "$SCRIPT_SHA256" ]]; then
+                      echo 'FAIL: mitigation script SHA-256 mismatch; refusing execution' >&2
+                      exit 1
+                  fi
+                  run_mode=$mode
+                  [[ $mode != loop ]] || run_mode=apply
+                  bash -c "$source" mitigation "$run_mode"
+                  [[ $mode == loop ]] || break
+                  sleep 3600
               done
-          readinessProbe:
-            exec:
-              command:
-                - /bin/bash
-                - -ec
-                - >-
-                  nsenter --target 1 --mount --uts --ipc --net --pid --root --wd --
-                  python3 - check < /opt/mitigation/mitigate.py
-            initialDelaySeconds: 5
-            periodSeconds: 30
-            timeoutSeconds: 15
-            failureThreshold: 1
-          resources:
-            requests:
-              cpu: 10m
-              memory: 32Mi
-            limits:
-              cpu: 200m
-              memory: 128Mi
-          volumeMounts:
-            - name: script
-              mountPath: /opt/mitigation
-              readOnly: true
-      volumes:
+            - launcher
+            - check
+          initialDelaySeconds: 5
+          periodSeconds: 60
+          timeoutSeconds: 55
+          failureThreshold: 1
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+        volumeMounts:
         - name: script
-          configMap:
-            name: emudhra-ca-mitigation
+          mountPath: /opt/mitigation
+          readOnly: true
+        - name: certs
+          mountPath: /etc/ssl/certs
+          readOnly: false
+        - name: system-sources
+          mountPath: /usr/share/ca-certificates
+          readOnly: true
+        - name: local-sources
+          mountPath: /usr/local/share/ca-certificates
+          readOnly: true
+        - name: state
+          mountPath: /var/lib/yc-emudhra-mitigation
+          readOnly: false
+        - name: work
+          mountPath: /tmp
+      volumes:
+      - name: script
+        configMap:
+          name: emudhra-ca-mitigation
+      - name: certs
+        hostPath:
+          path: /etc/ssl/certs
+          type: Directory
+      - name: system-sources
+        hostPath:
+          path: /usr/share/ca-certificates
+          type: Directory
+      - name: local-sources
+        hostPath:
+          path: /usr/local/share/ca-certificates
+          type: Directory
+      - name: state
+        hostPath:
+          path: /var/lib/yc-emudhra-mitigation
+          type: DirectoryOrCreate
+      - name: work
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Mi

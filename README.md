@@ -1,123 +1,124 @@
-# eMudhra CA mitigation for Yandex Managed Kubernetes
+# eMudhra CA Mitigation for Yandex Managed Kubernetes
 
-DaemonSet отключает доверие к двум корневым сертификатам, через которые может
-проверяться скомпрометированная цепочка eMudhra, на **worker-нодах** Managed
-Kubernetes. Работает без `apt`, обновления ОС и скачивания пакетов на хост.
+DaemonSet отключает доверие к скомпрометированным цепочкам eMudhra на всех
+Linux worker-нодах Yandex Managed Kubernetes, включая вновь добавленные ноды.
+Обновление ОС и установка пакетов не требуются.
 
-Основание: [рекомендация Ubuntu](https://ubuntu.com/blog/emudhra-ca-compromise-fixes-available),
-[USN-8944-1](https://ubuntu.com/security/notices/USN-8944-1).
+## Описание проблемы
 
-## Область действия
+Митигация удаляет из системного хранилища доверенных CA два корневых сертификата:
 
-- Системное хранилище CA Ubuntu/Debian на worker-нодах и использующий его
-  `containerd`.
-- Все ноды выбранного кластера, включая ноды с taints и вновь добавленные.
-- Не обновляет образы контейнеров, уже работающие
-  приложения, Java/NSS trust stores и собственные CA bundles приложений.
-  Их необходимо обновить отдельно. Это **не полное устранение инцидента во всём кластере**.
+- emSign ECC Root CA - G3.
+- AAA Certificate Services.
 
-## Что меняется
+Основание: [рекомендация Ubuntu](https://ubuntu.com/blog/emudhra-ca-compromise-fixes-available)
+и [USN-8944-1](https://ubuntu.com/security/notices/USN-8944-1).
 
-1. В `/etc/ca-certificates.conf` отключаются только
-   `mozilla/emSign_ECC_Root_CA_-_G3.crt` и `mozilla/Comodo_AAA_Services_root.crt`.
-2. При необходимости выполняется `update-ca-certificates --fresh`.
-   Остальные выбранные CA и локальные CA сохраняются; стандартные hooks
-   `update-ca-certificates` выполняются на хосте.
-3. Проверяется отсутствие сертификатов с SHA-256 отпечатками двух отозванных
-   корневых CA в системном bundle и файлах непосредственно в `/etc/ssl/certs`.
-4. `containerd` перезапускается для сброса кэша CA.
-   Хэш успешно обработанного bundle сохраняется в
-   `/var/lib/yc-emudhra-mitigation/restarted-bundle.sha256`.
-   Повторное применение к неизменному bundle не перезапускает сервис.
-   `kubelet` не перезапускается: в стандартной конфигурации mk8s он использует
-   отдельный CA из kubeconfig для соединения с Kubernetes API.
-5. Проверка и восстановление выполняются каждые 5 минут, readiness — каждые
-   30 секунд. Ошибка применения завершает контейнер с ненулевым кодом;
-   Kubernetes повторит запуск. Pod не готов, пока проверка не пройдёт.
+## Что делает фикс
 
-Если отозванный сертификат установлен повторно как пользовательский CA,
-проверка завершится ошибкой с его путём. Такой файл нужно удалить из источника
-локальных CA отдельно; пример не удаляет произвольные пользовательские файлы.
+DaemonSet автоматически на каждой worker-ноде:
 
-## Перед применением
+1. Удаляет указанные сертификаты из активного хранилища CA, сохраняя остальные сертификаты.
+2. Перезапускает работающие `containerd` и `dockerd`, чтобы они использовали обновлённое хранилище.
+3. Проверяет результат и восстановление сервисов.
+4. Повторяет проверку и применение **раз в час**. Если изменений нет, сервисы повторно не перезапускаются.
 
-Нужны права на создание privileged DaemonSet и ConfigMap в `kube-system`.
-На хосте нужны `python3`, `update-ca-certificates`, `systemctl` и systemd-сервис
-`containerd`. Образ `cr.yandex/mirror/ubuntu:22.04` должен быть доступен нодам;
-для закрытого контура зеркалируйте его в доступный registry и замените `image`.
+Фикс действует на системное хранилище ноды. **Образы контейнеров и собственные
+хранилища сертификатов приложений необходимо обновить отдельно.**
 
-Перезапуск `containerd` временно прерывает операции управления контейнерами и
-может вызвать кратковременный `NotReady`. Действующие контейнеры обычно
-продолжают работать через containerd-shim, но это зависит от конфигурации узла.
-Соединения с легитимными сервисами, использующими отозванные цепочки,
-перестанут проходить TLS-проверку.
+Обновление пакета CA или ручная пересборка хранилища могут вернуть удалённые
+сертификаты. В этом случае митигация повторно удалит их в следующем часовом цикле;
+до этого доверие к ним может восстановиться.
 
-Сначала проверьте на тестовом кластере / одной ноде, затем выберите окно работ.
-`maxUnavailable: 1` ограничивает **обновление** DaemonSet, но не его первое
-развёртывание и не одновременные изменения CA на нескольких нодах.
-Для поэтапного первого запуска добавьте в `spec.template.spec.nodeSelector`
-манифеста `emudhra-mitigation: enabled` и последовательно помечайте ноды:
+## Быстрый старт
+
+### 1. Скачать манифест
 
 ```bash
-kubectl label node <node-name> emudhra-mitigation=enabled
+wget https://raw.githubusercontent.com/yandex-cloud-examples/yc-mk8s-emudhra-mitigation/main/emudhra-mitigation-daemonset.yaml
 ```
 
-После проверки всех нод уберите дополнительный selector из манифеста и
-повторите `apply`, чтобы покрыть также будущие ноды.
+Или клонировать репозиторий:
 
-## Установка и проверка
+```bash
+git clone https://github.com/yandex-cloud-examples/yc-mk8s-emudhra-mitigation.git
+cd yc-mk8s-emudhra-mitigation
+```
 
-Скачайте этот каталог и проверьте выбранный Kubernetes context:
+### 2. Применить фикс
+
+Нужны права на создание ConfigMap и DaemonSet в `kube-system` с доступом к
+процессам и хранилищу CA нод. Сначала проверьте фикс на тестовом кластере.
+Первое применение выполняется на всех подходящих нодах; перезапуск runtime
+может кратковременно прервать операции управления контейнерами.
 
 ```bash
 kubectl config current-context
 kubectl apply -f emudhra-mitigation-daemonset.yaml
+```
+
+### 3. Проверить статус
+
+```bash
 kubectl -n kube-system rollout status daemonset/emudhra-ca-mitigation --timeout=10m
-kubectl -n kube-system get ds emudhra-ca-mitigation
+kubectl -n kube-system get daemonset emudhra-ca-mitigation
 kubectl -n kube-system get pods -l app=emudhra-ca-mitigation -o wide
+kubectl get nodes
+```
+
+В DaemonSet значения `DESIRED`, `CURRENT`, `READY` и `AVAILABLE` должны совпадать
+с числом ожидаемых Linux-нод. Ноды должны находиться в состоянии `Ready`.
+
+### 4. Посмотреть логи
+
+```bash
 kubectl -n kube-system logs -l app=emudhra-ca-mitigation --prefix --tail=50
 ```
 
-Убедитесь, что `DESIRED`, `CURRENT`, `READY`, `AVAILABLE` совпадают с числом
-ожидаемых Linux-нод. В логах каждой ноды должно появиться:
+В логах каждой ноды должно появиться сообщение:
 
 ```text
-PASS: affected roots absent from system bundle and certificate directory
+PASS: affected roots absent; runtimes running with verified CA store
 ```
 
-Принудительная read-only проверка конкретного пода:
+## Повторное применение
+
+Чтобы применить фикс немедленно, не дожидаясь часового цикла:
 
 ```bash
-kubectl -n kube-system exec <pod-name> -- bash -ec \
-  'nsenter --target 1 --mount --uts --ipc --net --pid --root --wd -- python3 - check < /opt/mitigation/mitigate.py'
-```
-
-## Обновление скрипта
-
-Код митигации редактируется непосредственно в `data.mitigate.py` ConfigMap
-в файле `emudhra-mitigation-daemonset.yaml`.
-Изменение только ConfigMap не вызывает автоматического перезапуска подов:
-новый код начнёт применяться после обновления смонтированного ConfigMap
-и очередного пятиминутного цикла.
-
-Чтобы применить изменённый код без ожидания очередного цикла, обновите
-манифест и перезапустите DaemonSet:
-
-```bash
-kubectl apply -f emudhra-mitigation-daemonset.yaml
 kubectl -n kube-system rollout restart daemonset/emudhra-ca-mitigation
 kubectl -n kube-system rollout status daemonset/emudhra-ca-mitigation --timeout=10m
 ```
 
-## Удаление
+## Удаление фикса
+
+После обновления нод на исправленный базовый образ удалите временную митигацию:
 
 ```bash
 kubectl delete -f emudhra-mitigation-daemonset.yaml
 ```
 
-Удаление DaemonSet останавливает мониторинг, но **не возвращает доверие** к
-отозванным CA. Настройки на нодах сохраняются после перезагрузки.
-При замене ноды нужна установка исправленного базового образа либо работающий
-DaemonSet. Не восстанавливайте старую конфигурацию целиком: это может затереть
-последующие изменения администратора. Исходная копия для диагностики хранится
-в `/var/lib/yc-emudhra-mitigation/ca-certificates.conf.before`.
+**Удаление DaemonSet не возвращает доверие к удалённым сертификатам**, но останавливает
+периодическую проверку. Пересборка хранилища из неисправленных исходников может
+снова добавить эти сертификаты.
+
+## Технические сведения
+
+- **Образ:** предустановленный `cr.yandex/yc/mk8s-openssl:stable`, `imagePullPolicy: Never`.
+  Если образ отсутствует на ноде, pod не запустится с ошибкой `ErrImageNeverPull`.
+- **Разрешения:** `hostPID`, запись в хранилище CA и каталог состояния; `privileged: false`,
+  Linux capabilities удалены, AppArmor отключён для отправки сигналов host-сервисам.
+- **Целостность:** скрипт проверяется по SHA-256 перед выполнением.
+- **Ресурсы:** requests — 10m CPU / 32Mi RAM; limits — 500m CPU / 128Mi RAM.
+- **Namespace:** `kube-system`.
+
+## Совместимость
+
+Предназначено для стандартных worker-нод Yandex Managed Kubernetes.
+Проверено на текущих поддерживаемых версиях >= **1.32.1, Ubuntu **22.04.5**:
+удаление CA, рестарты containerd и dockerd, сохранность работающего контейнера
+и запуск новых контейнеров после применения.
+
+## Лицензия
+
+Apache License 2.0. См. [LICENSE](LICENSE).
